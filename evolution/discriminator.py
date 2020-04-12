@@ -1,9 +1,10 @@
 from evolution import Phenotype
 import torch
+import evolution
 from evolution import Genome, Linear, Conv2d, Deconv2d
 import logging
 import torch.autograd as autograd
-from torch.autograd import Variable
+from torch import Tensor
 from .config import config
 import util.tensor_constants as tensor_constants
 from util import tools
@@ -15,25 +16,27 @@ logger = logging.getLogger(__name__)
 
 class Discriminator(Phenotype):
 
-    def __init__(self, output_size=1, genome=None, input_shape=None):
+    labels = None
+    fake_labels = None
+
+    def __init__(self, output_size=1, genome=None, input_shape=None, optimizer_conf=config.gan.discriminator.optimizer):
         super().__init__(output_size=output_size, genome=genome, input_shape=input_shape)
         self.output_size = output_size
+        self.optimizer_conf = optimizer_conf
 
         if genome is None:
             if config.gan.discriminator.fixed:
                 self.genome = Genome(random=False, add_layer_prob=0, rm_layer_prob=0, gene_mutation_prob=0,
                                      simple_layers=config.gan.discriminator.simple_layers)
                 if not config.gan.discriminator.simple_layers:
-                    self.genome.add(Conv2d(8, stride=2, activation_type="LeakyReLU", activation_params={"negative_slope": 0.2}))
-                    self.genome.add(Conv2d(16, stride=2, activation_type="LeakyReLU", activation_params={"negative_slope": 0.2}))
-                    self.genome.add(Conv2d(32, stride=2, activation_type="LeakyReLU", activation_params={"negative_slope": 0.2}))
                     self.genome.add(Conv2d(64, stride=2, activation_type="LeakyReLU", activation_params={"negative_slope": 0.2}))
                     self.genome.add(Conv2d(128, stride=2, activation_type="LeakyReLU", activation_params={"negative_slope": 0.2}))
-                # self.genome.add(Linear(1024, activation_type="ELU"))
+                    self.genome.add(Conv2d(256, stride=2, activation_type="LeakyReLU", activation_params={"negative_slope": 0.2}))
             else:
                 self.genome = Genome(random=not config.evolution.sequential_layers)
-                self.genome.possible_genes = [g for g in self.genome.possible_genes if g[0] != Deconv2d]
-                self.genome.add_random_gene()
+                self.genome.possible_genes = [(getattr(evolution, l), {}) for l in config.gan.discriminator.possible_layers]
+                # self.genome.add_random_gene()
+                self.genome.add(Conv2d())
 
             if config.gan.type == "gan":
                 self.genome.output_genes = [Linear(1, activation_type="Sigmoid", normalize=False)]
@@ -48,6 +51,14 @@ class Discriminator(Phenotype):
     def train_step(self, G, images):
         """Train the discriminator on real+fake"""
         self.zero_grad()
+
+        if self.labels is None:
+            self.labels = tools.cuda(Tensor(torch.ones(images.size(0))))
+            self.labels = self.labels * 0.9 if config.gan.label_smoothing else self.labels
+
+        if self.fake_labels is None:
+            self.fake_labels = tools.cuda(Tensor(torch.zeros(images.size(0))))
+            self.fake_labels = self.fake_labels + 0.1 if config.gan.label_smoothing else self.fake_labels
 
         #  1A: Train D on real
         real_error, real_decision = self.step_real(images)
@@ -64,14 +75,11 @@ class Discriminator(Phenotype):
             fake_error.backward()
 
         if config.gan.type == "rsgan":
-            labels = tools.cuda(Variable(torch.ones(images.size(0))))
-            real_error = self.criterion(real_decision.view(-1) - fake_decision.view(-1), labels)
+            real_error = self.criterion(real_decision.view(-1) - fake_decision.view(-1), self.labels)
             real_error.backward()
             fake_error = tools.cuda(torch.FloatTensor([0]))
         elif config.gan.type == "rasgan":
-            labels = tools.cuda(Variable(torch.ones(images.size(0))))
-            labels_zeros = tools.cuda(Variable(torch.zeros(images.size(0))))
-            real_error = (self.criterion(real_decision.view(-1) - torch.mean(fake_decision.view(-1)), labels) + self.criterion(torch.mean(fake_decision.view(-1)) - real_decision.view(-1), labels_zeros))/2
+            real_error = (self.criterion(real_decision.view(-1) - torch.mean(fake_decision.view(-1)), self.labels) + self.criterion(torch.mean(fake_decision.view(-1)) - real_decision.view(-1), self.fake_labels))/2
             real_error.backward()
             fake_error = tools.cuda(torch.FloatTensor([0]))
 
@@ -92,6 +100,8 @@ class Discriminator(Phenotype):
             gradient_penalty.backward()
 
         self.optimizer.step()  # Only optimizes D's parameters; changes based on stored gradients from backward()
+        self.calc_win_rate(real_decision, fake_decision, G)
+
         # Wasserstein distance
         if config.gan.type == "wgan":
             return (real_error - fake_error).item()
@@ -105,9 +115,7 @@ class Discriminator(Phenotype):
         elif config.gan.type == "lsgan":
             return 0.5 * torch.mean((real_decision - 1)**2), real_decision
 
-        labels = tools.cuda(Variable(torch.ones(images.size(0))))
-        labels = labels * 0.9 if config.gan.label_smoothing else labels
-        return self.criterion(real_decision.view(-1), labels), real_decision
+        return self.criterion(real_decision.view(-1), self.labels), real_decision
 
     def step_fake(self, G, batch_size):
         gen_input = G.generate_noise(batch_size)
@@ -119,14 +127,30 @@ class Discriminator(Phenotype):
         elif config.gan.type == "lsgan":
             return 0.5 * torch.mean((fake_decision)**2), fake_data, fake_decision
 
-        fake_labels = tools.cuda(Variable(torch.zeros(batch_size)))
-        fake_labels = fake_labels + 0.1 if config.gan.label_smoothing else fake_labels
-        return self.criterion(fake_decision.view(-1), fake_labels), fake_data, fake_decision
+        return self.criterion(fake_decision.view(-1), self.fake_labels), fake_data, fake_decision
 
     def eval_step(self, G, images):
-        fake_error, _, _ = self.step_fake(G, images.size(0))
-        real_error, _ = self.step_real(images)
+        fake_error, _, fake_decision = self.step_fake(G, images.size(0))
+        real_error, real_decision = self.step_real(images)
+        self.calc_win_rate(real_decision, fake_decision, G)
         return real_error.item() + fake_error.item()
+
+    def calc_win_rate(self, real_decision, fake_decision, G):
+        if self.skill_rating_enabled():
+            # self.win_rate += (sum((real_decision > 0.5).float()) + sum((fake_decision < 0.5).float())).item()/(len(real_decision) + len(fake_decision))
+            self.win_rate += (torch.mean(real_decision).item() + (1-torch.mean(fake_decision)).item())/2
+
+            # for match in [torch.mean((real_decision > 0.5).float()).item(), torch.mean((real_decision < 0.5).float()).item()]:
+            # for match in [torch.mean(real_decision) > 0.5, torch.mean(fake_decision).item() < 0.5]:
+            #     match = int(match)
+            #     self.skill_rating_games.append((match, G.skill_rating))
+            #     G.skill_rating_games.append((1 - match, self.skill_rating))
+
+            # matches = [(p > 0.5) for p in real_decision] + [(p < 0.5) for p in fake_decision]
+            # for match in matches:
+            #     match = match.float().item()
+            #     self.skill_rating_games.append((match, G.skill_rating))
+            #     G.skill_rating_games.append((1 - match, self.skill_rating))
 
     def gradient_penalty(self, real_data, fake_data):
         batch_size = real_data.size()[0]
@@ -134,7 +158,7 @@ class Discriminator(Phenotype):
         alpha = tools.cuda(alpha.expand_as(real_data))
 
         interpolates = alpha * real_data + ((1 - alpha) * fake_data)
-        interpolates = autograd.Variable(interpolates, requires_grad=True)
+        interpolates = interpolates.clone().detach().requires_grad_(True)
 
         disc_interpolates = tools.cuda(self(interpolates))
         gradients = autograd.grad(outputs=disc_interpolates, inputs=interpolates,
@@ -146,4 +170,6 @@ class Discriminator(Phenotype):
     def fitness(self):
         if config.evolution.fitness.discriminator == "AUC":
             return self.fitness_value
+        if config.evolution.fitness.discriminator == "skill_rating":
+            return -self.skill_rating.mu #+ 2*self.skill_rating.phi
         return super().fitness()

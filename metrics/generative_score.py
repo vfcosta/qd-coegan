@@ -5,18 +5,20 @@ from util import tools
 import logging
 import torch
 from evolution.config import config
+import time
 
 
 base_fid_statistics = None
 inception_model = None
 logger = logging.getLogger(__name__)
+use_cuda = True
 
 
 def initialize_fid(train_loader, sample_size=1000):
     global base_fid_statistics, inception_model
     if inception_model is None:
         inception_model = InceptionV3([InceptionV3.BLOCK_INDEX_BY_DIM[config.evolution.fitness.fid_dimension]])
-    inception_model = tools.cuda(inception_model)
+    inception_model = tools.cuda(inception_model, use_cuda)
 
     if base_fid_statistics is None:
         logger.debug("calculate base fid statistics")
@@ -29,8 +31,8 @@ def initialize_fid(train_loader, sample_size=1000):
                 break
         train_images = np.array(train_images)
         base_fid_statistics = fid_score.calculate_activation_statistics(
-            train_images, inception_model, cuda=tools.is_cuda_available(),
-            dims=config.evolution.fitness.fid_dimension)
+            train_images, inception_model, cuda=tools.is_cuda_available(use_cuda),
+            dims=config.evolution.fitness.fid_dimension, batch_size=config.evolution.fitness.fid_batch_size)
         inception_model.cpu()
 
 
@@ -40,17 +42,19 @@ def fid(generator, sample_size=1000, noise=None):
         if noise is None:
             noise = generator.generate_noise(sample_size)
         generated_images = generator(noise.cpu()).detach()
-    score = fid_images(generated_images)
+        score = fid_images(generated_images)
     generator.zero_grad()
     return score
 
 
 def fid_images(generated_images):
     global base_fid_statistics, inception_model
-    inception_model = tools.cuda(inception_model)
+    inception_model = tools.cuda(inception_model, use_cuda)
+    start_time = time.time()
     m1, s1 = fid_score.calculate_activation_statistics(
-        generated_images.data.cpu().numpy(), inception_model, cuda=tools.is_cuda_available(),
-        dims=config.evolution.fitness.fid_dimension)
+        generated_images.numpy(), inception_model, cuda=tools.is_cuda_available(use_cuda),
+        dims=config.evolution.fitness.fid_dimension, batch_size=config.evolution.fitness.fid_batch_size)
+    print("FID: calc activation --- %s seconds ---" % (time.time() - start_time))
     inception_model.cpu()
     m2, s2 = base_fid_statistics
     ret = fid_score.calculate_frechet_distance(m1, s1, m2, s2)

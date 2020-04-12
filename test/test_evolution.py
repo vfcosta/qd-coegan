@@ -13,9 +13,11 @@ class TestEvolution(unittest.TestCase):
     def setUp(self):
         self.genome = Genome()
         self.phenotype = Phenotype(1, self.genome)
-        config.optimizer.copy_optimizer_state = True
-        config.optimizer.type = "Adam"
+        config.gan.generator.optimizer.copy_optimizer_state = True
+        config.gan.generator.optimizer.type = "Adam"
+        config.gan.discriminator.optimizer = config.gan.generator.optimizer
         config.evolution.sequential_layers = True
+        self.phenotype.optimizer_conf = config.gan.generator.optimizer
 
     def evaluate_model(self, input_shape):
         x = Variable(torch.randn(input_shape[0], int(np.prod(input_shape[1:]))))  # create some input data
@@ -214,8 +216,8 @@ class TestEvolution(unittest.TestCase):
         self.genome.add(Linear(32*32*3))
         self.genome.add(Deconv2d(4))
         self.assertEqual([Linear, Linear, Deconv2d, Deconv2d], [gene.__class__ for gene in self.genome.genes])
-        self.evaluate_model([5, 1, 32, 32])
-        x = Variable(torch.randn(5, 32*32))
+        self.evaluate_model([8, 1, 32, 32])
+        x = Variable(torch.randn(8, 32*32))
         self.phenotype.create_model(x)
         self.train_step(self.phenotype, x)
 
@@ -279,7 +281,22 @@ class TestEvolution(unittest.TestCase):
         other = copy.deepcopy(self.genome)
         other.add(Linear(8))
         other.add(Linear(1))
-        self.assertEqual(2, self.genome.distance(other))
+        self.assertEqual(2, self.genome.distance(other, mode="num_genes"))
+
+    def test_different_genome_setup(self):
+        self.genome.add(Conv2d(32, activation_type="LeakyReLU"))
+        self.genome.add(Conv2d(32))
+        self.genome.add(Linear(16))
+        other = Genome()
+        other.add(Conv2d(32, activation_type="ReLU"))
+        other.add(Conv2d(64))
+        other.add(Linear(16))
+        x = Variable(torch.randn(5, 32*32)).view(5, 1, 32, 32)
+        self.phenotype.create_model(x)
+        other_phenotype = Phenotype(1, other)
+        other_phenotype.optimizer_conf = self.phenotype.optimizer_conf
+        other_phenotype.create_model(x)
+        self.assertEqual(0.4, self.genome.distance(other, mode="num_genes"))
 
     def test_equal_genome_distance_after_breed(self):
         self.genome.add(Linear(32))
@@ -327,7 +344,7 @@ class TestEvolution(unittest.TestCase):
         mate = Genome()
         mate.add(Conv2d(8))
         mate.add(Linear(16))
-        phenotype_mate = Phenotype(1, mate)
+        phenotype_mate = Phenotype(1, mate, optimizer_conf=self.phenotype.optimizer_conf)
         mate.output_genes.append(Linear(activation_type='Sigmoid'))
         phenotype_mate.create_model(x)
         self.train_step(phenotype_mate, x)
@@ -392,6 +409,22 @@ class TestEvolution(unittest.TestCase):
         out = self.phenotype.model(x)
         self.assertEqual([28, 28], list(out.size()[2:]))
 
+    def test_multiple_deconv2d_outchannels(self):
+        self.phenotype.output_size = (1, 28, 28)
+        self.genome.linear_at_end = False
+        self.genome.add(Linear(576))
+        self.genome.add(Deconv2d(64, kernel_size=3))
+        self.genome.add(Deconv2d(32, kernel_size=3))
+        self.genome.output_genes.append(Deconv2d(1))
+        x = Variable(torch.randn(5, 100)).view(5, 1, 10, 10)
+        self.phenotype.create_model(x)
+        self.genome.add(Deconv2d())
+        config.layer.conv2d.random_out_channels = False
+        model = self.phenotype.transform_genotype(x)
+        out = model(x)
+        self.assertEqual(self.genome.genes[-2].out_channels//2, self.genome.genes[-1].out_channels)
+        self.assertEqual([28, 28], list(out.size()[2:]))
+
     def test_simple_deconv2d(self):
         self.phenotype.output_size = (1, 28, 28)
         self.genome.linear_at_end = False
@@ -421,6 +454,71 @@ class TestEvolution(unittest.TestCase):
         self.phenotype.create_model(x)
         out = self.phenotype.model(x)
         self.assertEqual([64, 64], list(out.size()[2:]))
+
+    def test_freeze_weight(self):
+        config.gan.generator.optimizer.type = "RMSprop"
+        self.genome.add(Conv2d(16))
+        self.genome.add(Linear(32))
+        self.genome.add(Linear(16))
+        self.genome.output_genes.append(Linear(out_features=1, activation_type='Sigmoid'))
+        x = Variable(torch.randn(5, 64)).view(5, 1, 8, 8)
+        self.phenotype.create_model(x)
+        self.train_step(self.phenotype, x)
+        weight = self.genome.genes[0].module.weight.clone()
+        self.train_step(self.phenotype, x)
+        self.assertFalse(weight.equal(self.genome.genes[0].module.weight))
+        config.evolution.freeze_when_change = True
+        for gene in self.genome.genes:
+            weight, bias = gene.module.weight.clone(), gene.module.bias.clone()
+            gene.freeze()
+            self.train_step(self.phenotype, x)
+            self.assertTrue(weight.equal(gene.module.weight))
+            self.assertTrue(bias.equal(gene.module.bias))
+            gene.unfreeze()
+            self.train_step(self.phenotype, x)
+            self.assertFalse(weight.equal(gene.module.weight))
+            self.assertFalse(bias.equal(gene.module.bias))
+
+    def test_deconv_output_channels(self):
+        self.phenotype.output_size = (1, 28, 28)
+        self.genome.linear_at_end = False
+        self.genome.add(Linear())
+        self.genome.add(Deconv2d(32))
+        self.genome.add(Deconv2d(16))
+        self.genome.add(Deconv2d(8))
+        self.genome.add(Deconv2d(4))
+        x = Variable(torch.randn(1, 100))
+        model = self.phenotype.transform_genotype(x)
+        print(model)
+        out = model(x)
+        self.assertEqual([1, 1, 28, 28], list(out.size()))
+
+    def test_add_deconv_not_random_out(self):
+        config.layer.conv2d.random_out_channels = False
+        self.phenotype.output_size = (1, 28, 28)
+        self.genome.linear_at_end = False
+        self.genome.add(Linear())
+        self.genome.add(Deconv2d())
+        x = Variable(torch.randn(8, 100))
+        model = self.phenotype.transform_genotype(x)
+        print(model)
+        out = model(x)
+        self.assertEqual([8, 1, 28, 28], list(out.size()))
+        self.genome.add(Deconv2d())
+        model = self.phenotype.transform_genotype(x)
+        print(model)
+        out = model(x)
+        self.assertEqual([8, 1, 28, 28], list(out.size()))
+
+    def test_breed_copy_skill_Rating(self):
+        x = Variable(torch.randn(5, 64)).view(5, 1, 8, 8)
+        self.genome.add(Conv2d(2))
+        self.genome.add(Linear(16))
+        self.genome.output_genes.append(Linear(activation_type='Sigmoid'))
+        self.phenotype.create_model(x)
+        self.phenotype.skill_rating.mu = 2000
+        phenotype2 = self.phenotype.breed()
+        self.assertEqual(self.phenotype.skill_rating.mu, phenotype2.skill_rating.mu)
 
 
 if __name__ == '__main__':

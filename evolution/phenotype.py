@@ -1,6 +1,4 @@
-# -*- coding: future_fstrings -*-
 import torch
-from torch.autograd import Variable
 import torch.nn as nn
 from .genes import Linear, Layer, Deconv2d
 from .layers.reshape import Reshape
@@ -10,6 +8,7 @@ import traceback
 from .config import config
 import logging
 import json
+from metrics.glicko2 import glicko2
 
 logger = logging.getLogger(__name__)
 
@@ -26,32 +25,43 @@ class Phenotype(nn.Module):
             self.optimizer = None
             self.invalid = True
 
-    def __init__(self, output_size, genome=None, input_shape=None):
+    def __init__(self, output_size, genome=None, input_shape=None, optimizer_conf={}):
         super().__init__()
         self.genome = genome
         self.optimizer = None
+        self.optimizer_conf = optimizer_conf
         self.model = None
         self.output_size = output_size
         self.error = None
         self.fitness_value = 0
+        self.win_rate = 0
         self.invalid = False
         self.input_shape = input_shape
         self.trained_samples = 0
         self.random_fitness = None
+        self.glicko = glicko2.Glicko2(mu=1500, phi=350, sigma=config.evolution.fitness.skill_rating.sigma, tau=config.evolution.fitness.skill_rating.tau)
+        self.skill_rating = self.glicko.create_rating()
+        self.last_error = None
+        self.skill_rating_games = []
+        self.rank = None
+        self.crowding_distance = None
+        self.objectives = []
         if config.gan.type in ["rsgan", "rasgan"]:
             self.criterion = nn.BCEWithLogitsLoss()
         else:
             self.criterion = nn.BCELoss()
 
-    def breed(self, mate=None, skip_mutation=False):
+    def breed(self, mate=None, skip_mutation=False, freeze=False):
         mate_genome = mate.genome if mate else None
-        genome = self.genome.breed(skip_mutation=skip_mutation, mate=mate_genome)
-        p = self.__class__(output_size=self.output_size, genome=genome, input_shape=self.input_shape)
+        genome = self.genome.breed(skip_mutation=skip_mutation, mate=mate_genome, freeze=freeze)
+        p = self.__class__(output_size=self.output_size, genome=genome, input_shape=self.input_shape,
+                           optimizer_conf=self.optimizer_conf)
         try:
             p.setup()
             self.copy_to(p)
             if mate:
                 mate.copy_to(p)
+            p.model.zero_grad()
         except Exception as err:
             logger.error(err)
             traceback.print_exc()
@@ -67,17 +77,34 @@ class Phenotype(nn.Module):
     def setup(self):
         # create some input data
         with torch.no_grad():
-            x = Variable(torch.randn(self.input_shape[0], int(np.prod(self.input_shape[1:]))))
-        x = x.view(self.input_shape)  # convert to the same shape as input
+            x = torch.randn([1] + list(self.input_shape[1:]))
         self.create_model(x)
+
+    def clone(self):
+        self.genome.optimizer_gene.optimizer = None
+        genome = copy.deepcopy(self.genome)
+        p = self.__class__(output_size=self.output_size, genome=genome, input_shape=self.input_shape)
+        try:
+            p.setup()
+            self.copy_to(p)
+            p.model.zero_grad()
+        except Exception as err:
+            logger.error(err)
+        return p
 
     def copy_to(self, target):
         """
         Copy the phenotype parameters to the target.
         This copy will keep the parameters that match in size from the optimizer.
         """
+        target.last_error = self.last_error
         target.trained_samples = self.trained_samples
-        if not config.optimizer.copy_optimizer_state:
+        # if not target.genome.mutated:
+        target.skill_rating = glicko2.Rating(self.skill_rating.mu, self.skill_rating.phi, self.skill_rating.sigma)
+        # else:
+            # target.skill_rating = self.glicko.create_rating()
+            # target.skill_rating.mu = min(self.skill_rating.mu, target.skill_rating.mu)
+        if not self.optimizer_conf.get("copy_optimizer_state"):
             return
 
         old_state_dict = self.optimizer.state_dict()
@@ -99,6 +126,8 @@ class Phenotype(nn.Module):
                     target.optimizer.state[param] = copy.deepcopy(old_state)
 
     def do_train(self, phenotype, images):
+        # if self.genome.freeze:
+        #     return self.last_error
         if phenotype.invalid:
             return
         if self.invalid:
@@ -108,6 +137,7 @@ class Phenotype(nn.Module):
             if self.error is None:
                 self.error = 0
             self.error += self.train_step(phenotype, images)
+            self.last_error = self.error
             self.trained_samples += len(images)
             self.genome.increase_usage_counter()
         except Exception as err:
@@ -117,11 +147,12 @@ class Phenotype(nn.Module):
             self.error += 100  # penalty for invalid genotype
 
     def do_eval(self, phenotype, images):
-        if self.invalid:
-            self.error = 100
-            return
-        self.error = self.error or 0
-        self.error += self.eval_step(phenotype, images)
+        self.eval_step(phenotype, images)
+        # if self.invalid:
+        #     self.error = 100
+        #     return
+        # self.error = self.error or 0
+        # self.error += self.eval_step(phenotype, images)
 
     def create_model(self, input_data):
         self.input_shape = input_data.size()
@@ -129,6 +160,10 @@ class Phenotype(nn.Module):
             self.model = self.transform_genotype(input_data)
         if self.optimizer is None:
             self.optimizer = self.genome.optimizer_gene.create_phenotype(self)
+        self.genome.num_params = self.num_params()
+
+    def num_params(self):
+        return sum(p.numel() for p in self.parameters() if p.requires_grad)
 
     def transform_genotype(self, input_data):
         """Generates a generic model using pytorch."""
@@ -140,10 +175,6 @@ class Phenotype(nn.Module):
         # count how many deconvs exists in the model
         deconv_layers = list(filter(lambda x: isinstance(x, Deconv2d), genes))
         n_deconv2d = len(deconv_layers)
-        if deconv_layers:
-            # consider the first deconv as a layer that will increase out channels but not the image size
-            n_deconv2d -= 1
-
         has_new_gene = len([g for g in genes if g.used == 0]) > 0
 
         # iterate over genes to create a pytorch sequential model
@@ -165,15 +196,23 @@ class Phenotype(nn.Module):
                 if isinstance(self.output_size, int):
                     gene.out_features = self.output_size
                 else:
+                    # TODO: check the dimensions of the first linear layer in generators
                     div = 2**n_deconv2d
-                    gene.out_features = div*div * self.output_size[0] * int(np.round(self.output_size[1]/div)) * int(np.round(self.output_size[2]/div))
+                    if gene.next_layer is not None and not gene.next_layer.out_channels:
+                        gene.next_layer.out_channels = 2 ** np.random.randint(config.layer.conv2d.min_channels_power, config.layer.conv2d.max_channels_power)
+                    if isinstance(gene.next_layer, Deconv2d):
+                        d = 2 if gene.next_layer.out_channels < 2 ** config.layer.conv2d.max_channels_power else 1
+                        gene.out_features = d * gene.next_layer.out_channels * int(np.ceil(self.output_size[1] / div)) * int(np.ceil(self.output_size[2] / div))
+                    else:
+                        # should never occurs for generators
+                        gene.out_features = 4 * int(np.ceil(self.output_size[1] / div)) * div * int(np.ceil(self.output_size[2] / div)) * div
 
             # adjust shape for 2d layer
             if not gene.is_linear() and len(next_input_shape) == 2:
-                d = max(1, int(next_input_size//np.prod(self.output_size[1:])))  # calc the multiple of output shape (e.g., dx28x28)
                 # adjust shape based on the next layers
                 div = 2**n_deconv2d
-                next_input_shape = (-1, d*div*div, int(np.round(self.output_size[1]/div)), int(np.round(self.output_size[2]/div)))
+                w, h = int(np.ceil(self.output_size[1]/div)), int(np.ceil(self.output_size[2]/div))
+                next_input_shape = (-1, next_input_size//w//h, w, h)
                 layers.append(Reshape(next_input_shape))
 
             new_layer = gene.create_phenotype(next_input_shape, self.output_size)
@@ -209,6 +248,30 @@ class Phenotype(nn.Module):
 
     def valid(self):
         return not self.invalid and self.error is not None
+
+    def skill_rating_enabled(self):
+        return config.stats.calc_skill_rating or config.evolution.fitness.discriminator == "skill_rating" or\
+               config.evolution.fitness.generator == "skill_rating"
+
+    def calc_skill_rating(self, adversarial):
+        if not self.skill_rating_enabled():
+            return
+        rating = self.glicko.create_rating(mu=adversarial.skill_rating.mu, phi=adversarial.skill_rating.phi, sigma=adversarial.skill_rating.sigma)
+        # self.skill_rating_games.append((1 if self.win_rate > 0.5 else 0, rating))
+        self.skill_rating_games.append((self.win_rate, rating))
+
+    def finish_calc_skill_rating(self):
+        if not self.skill_rating_enabled():
+            return
+        if len(self.skill_rating_games) == 0:
+            logger.warning("no games to update the skill rating")
+            return
+        print("finish_calc_skill_rating", self.skill_rating_games)
+        self.skill_rating = self.glicko.rate(self.skill_rating, self.skill_rating_games)
+        self.skill_rating_games = []
+
+    def reset_optimizer_state(self):
+        self.optimizer = self.genome.optimizer_gene.create_phenotype(self)
 
     @classmethod
     def load(cls, path):

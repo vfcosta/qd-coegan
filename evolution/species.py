@@ -20,7 +20,7 @@ class Species(list):
         return phenotype.fitness() / len(self)
 
     def best(self):
-        return self.sorted()[0]
+        return min(self, key=lambda x: self.fitness(x))
 
     def best_percent(self, percent):
         sorted_individuals = self.sorted()

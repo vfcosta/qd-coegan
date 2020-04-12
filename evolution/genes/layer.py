@@ -11,8 +11,7 @@ class Layer(Gene):
     """Represents a Layer (e.g., FC, conv, deconv) and its
     hyperparameters (e.g., activation function) in the evolving model."""
 
-    # ACTIVATION_TYPES = ["ReLU"]
-    ACTIVATION_TYPES = ["ReLU", "LeakyReLU", "ELU", "Sigmoid", "Tanh"]
+    ACTIVATION_TYPES = config.layer.activation_functions
 
     def __init__(self, activation_type="random", activation_params={}, normalize=True, use_dropout=False):
         super().__init__()
@@ -37,6 +36,7 @@ class Layer(Gene):
             self.activation_type = self._original_activation_type
         elif self.activation_type is None:
             self.activation_type = np.random.choice(Layer.ACTIVATION_TYPES)
+            self.activation_params = {"negative_slope": 0.2} if self.activation_type == "LeakyReLU" else {}
 
     def create_phenotype(self, input_shape, final_output_shape):
         self.input_shape = input_shape
@@ -48,8 +48,8 @@ class Layer(Gene):
             modules.append(MinibatchStdDev())
 
         if self.module is None or self.changed() or not config.layer.keep_weights:
-            self.normalization = self.create_normalization()
             self.module = self._create_phenotype(self.input_shape)
+            self.normalization = self.create_normalization()
             if self.has_wscale():
                 self.wscale = WScaleLayer(self.module)
             if not self.adjusted:
@@ -94,7 +94,7 @@ class Layer(Gene):
 
     def reset(self):
         self.module = None  # reset weights
-        self.uuid = uuid.uuid4()  # assign a new uuid
+        self.uuid = str(uuid.uuid4())  # assign a new uuid
 
     def named_parameters(self):
         if self.module is None:
@@ -102,6 +102,7 @@ class Layer(Gene):
         return self.module.named_parameters()
 
     def freeze(self):
+        # XXX: If the optimizer has momentum, the parameters will still change. The gradients will be zeroed though.
         if not config.evolution.freeze_when_change:
             return
         print('freeze layer', self.freezed)

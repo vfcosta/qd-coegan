@@ -1,9 +1,9 @@
-# -*- coding: future_fstrings -*-
 from .genes import Linear, Conv2d, Optimizer, Deconv2d
 import numpy as np
 from .config import config
 import logging
 import copy
+import uuid
 
 logger = logging.getLogger(__name__)
 
@@ -30,18 +30,28 @@ class Genome:
         self.simple_layers = simple_layers
         self.crossover_rate = crossover_rate
         self.possible_genes = [(Linear, {})]
+        self.num_params = 0
+        self.mutated = False
+        self.uuid = str(uuid.uuid4())
+        self.parents_uuid = []
+        self.freeze = False
+        self.original_genome = None
         if not self.simple_layers:
             self.possible_genes += [(Conv2d, {}), (Deconv2d, {})]
 
-    def breed(self, mate=None, skip_mutation=False):
+    def breed(self, mate=None, skip_mutation=False, freeze=False):
         # reset the optimizer to prevent copy
         self.optimizer_gene.optimizer = None
-        genome = copy.deepcopy(self)
+        genome = copy.deepcopy(self) if self.original_genome is None else copy.deepcopy(self.original_genome)
+        genome.uuid = str(uuid.uuid4())
+        genome.parents_uuid = [self.uuid]
         genome.age = self.age + 1
         if mate is not None:
             genome.crossover(mate)
         if not skip_mutation:
             genome.mutate()
+        self.freeze = freeze
+        self.original_genome = copy.deepcopy(genome) if freeze else None
         return genome
 
     def crossover(self, mate):
@@ -104,28 +114,26 @@ class Genome:
     def mutate(self):
         # FIXME: improve this method
         self.optimizer_gene.mutate()
-        mutated = False
+        self.mutated = False
         for gene in self.genes:
-            mutated |= gene.mutate(probability=self.gene_mutation_prob)
+            self.mutated |= gene.mutate(probability=self.gene_mutation_prob)
         if np.random.rand() <= self.add_layer_prob and len(self.genes) < self.max_layers:
             logger.debug("MUTATE add")
             self.add_random_gene()
-            mutated = True
+            self.mutated = True
         if np.random.rand() <= self.rm_layer_prob and len(self.genes) > 1:
             self.remove_random_gene()
-            mutated = True
-        if mutated:
+            self.mutated = True
+        if self.mutated:
             self.age = 0
 
     def remove_random_gene(self):
         removed = np.random.choice(self.genes)
-        new_genes = list(self._genes)
-        new_genes.remove(removed)
-
-        parametrized_genes = [g for g in new_genes if isinstance(g, Conv2d) or isinstance(g, Linear)]
-        if len(parametrized_genes) > 0:
-            logger.debug("MUTATE rm")
-            self._genes.remove(removed)
+        if isinstance(removed, Linear) and not self.linear_at_end:
+            logger.debug("MUTATE rm skip")
+            return
+        logger.debug("MUTATE rm")
+        self._genes.remove(removed)
 
     def increase_usage_counter(self):
         """Increase gene usage counter"""
@@ -145,19 +153,79 @@ class Genome:
         new_uuids = set(uuids) - set(current_uuids)
         return [uuids.index(u) for u in new_uuids]
 
-    def distance(self, genome, c=1):
+    def clean_copy(self):
+        """Return the genome without heavy parameters (weights, etc)"""
+        genome = Genome(random=self.random)
+        for g in self.genes:
+            g_copy = copy.copy(g)
+            g_copy.module = None
+            genome.genes.append(g_copy)
+        for g in self.output_genes:
+            g_copy = copy.copy(g)
+            g_copy.module = None
+            genome.output_genes.append(g_copy)
+        return genome
+
+    @classmethod
+    def from_json(cls, data):
+        genome = Genome(random=False)
+        for i, row in enumerate(data):
+            if row["type"] == "Deconv2d":
+                layer = Deconv2d(activation_type=row["activation_type"], out_channels=row["out_channels"])
+                layer.in_channels = row["in_channels"]
+            elif row["type"] == "Conv2d":
+                layer = Conv2d(activation_type=row["activation_type"], out_channels=row["out_channels"])
+                layer.in_channels = row["in_channels"]
+            else:
+                layer = Linear(activation_type=row["activation_type"], out_features=row["out_features"])
+            if i == len(data) - 1:
+                genome.output_genes = [layer]
+            else:
+                genome.add(layer)
+        return genome
+
+    def distance(self, genome, c=1, mode=config.evolution.speciation.distance):
         """Calculates the distance between the current genome and the genome passed as parameter."""
         n = 1  # max(len(genome.genes), len(self.genes))  # get the number of genes in the larger genome
+        d = 0
 
-        # get uuids from both genomes
-        current_uuids = set([g.uuid for g in self.genes])
-        uuids = set([g.uuid for g in genome.genes])
+        if mode == "uuid":
+            # get uuids from both genomes
+            current_uuids = set([g.uuid for g in self.genes])
+            uuids = set([g.uuid for g in genome.genes])
+            # calculates the number of different genes
+            d = len(current_uuids.symmetric_difference(uuids))
 
-        # calculates the number of different genes
-        # d = len(current_uuids.symmetric_difference(uuids))
+        # use num_genes difference and internal setup to compute the difference
+        # TODO: consider the age
+        if mode == "num_genes":
+            d = abs(len(self.genes) - len(genome.genes))
+            if d == 0:
+                for g1, g2 in zip(self.genes, genome.genes):
+                    if g1.__class__ != g2.__class__:
+                        d += 0.3
+                    if g1.activation_type != g2.activation_type:
+                        d += 0.1
+                    if isinstance(g1, Linear) and isinstance(g2, Linear):
+                        if g1.in_features != g2.in_features:
+                            d += 0.1
+                        if g1.out_features != g2.out_features:
+                            d += 0.1
+                    if isinstance(g1, Conv2d) and isinstance(g2, Conv2d):
+                        if g1.in_channels != g2.in_channels:
+                            d += 0.1
+                        if g1.out_channels != g2.out_channels:
+                            d += 0.1
 
-        # TODO: test the number of genes to identify differences
-        d = abs(len(self.genes) - len(genome.genes))
+        if mode == "num_genes_per_type":
+            linear_genes = [g for g in self.genes if g.is_linear()]
+            non_linear_genes = [g for g in self.genes if not g.is_linear()]
+            linear_genes2 = [g for g in genome.genes if g.is_linear()]
+            non_linear_genes2 = [g for g in genome.genes if not g.is_linear()]
+            d = abs(len(linear_genes) - len(linear_genes2)) + abs(len(non_linear_genes) - len(non_linear_genes2))
+
+        if mode == "parameter":
+            d = abs(self.num_params - genome.num_params)
         return c*d/n
 
     @property

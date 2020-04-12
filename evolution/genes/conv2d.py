@@ -1,4 +1,3 @@
-# -*- coding: future_fstrings -*-
 import torch.nn as nn
 from .layer2d import Layer2D
 import numpy as np
@@ -9,7 +8,7 @@ from util import tools
 class Conv2d(Layer2D):
     """Represents a convolution layer."""
 
-    def __init__(self, out_channels=None, kernel_size=5, stride=2, activation_type="random", padding=1, activation_params={}, normalize=True, use_dropout=config.gan.dropout):
+    def __init__(self, out_channels=None, kernel_size=config.layer.conv2d.kernel_size, stride=2, activation_type="random", padding=1, activation_params={}, normalize=True, use_dropout=config.gan.dropout):
         super().__init__(activation_type=activation_type, activation_params=activation_params, normalize=normalize, use_dropout=use_dropout)
         self.stride = stride
         self.kernel_size = kernel_size
@@ -25,9 +24,11 @@ class Conv2d(Layer2D):
             self.kernel_size = min(self.kernel_size, self.input_shape[2])
         if self.out_channels is None:
             if self.first_conv() or config.layer.conv2d.random_out_channels:
-                self.out_channels = 2 ** np.random.randint(4, config.layer.conv2d.max_channels_power+1)
+                self.out_channels = 2 ** np.random.randint(config.layer.conv2d.min_channels_power, config.layer.conv2d.max_channels_power+1)
             else:
                 self.out_channels = min(2 * self.in_channels, 2**(config.layer.conv2d.max_channels_power+1))
+        if config.layer.conv2d.force_double:
+            self.out_channels = max(self.out_channels, self.in_channels*2)
 
     def changed(self):
         module_kernel_size = self.module.kernel_size
@@ -37,7 +38,8 @@ class Conv2d(Layer2D):
                self.kernel_size != module_kernel_size
 
     def _create_phenotype(self, input_shape):
-        module = nn.Conv2d(self.in_channels, self.out_channels, self.kernel_size, self.stride, padding=self.padding)
+        module = nn.Conv2d(self.in_channels, self.out_channels, self.kernel_size, self.stride, padding=self.padding,
+                           bias=not config.gan.batch_normalization)
 
         if self.module is None or not config.layer.resize_weights:
             if self.has_wscale():
@@ -48,8 +50,17 @@ class Conv2d(Layer2D):
                 nn.init.xavier_uniform_(module.weight)
         elif self.kernel_size == self.module.kernel_size[0]:
             # resize and copy weights only when the kernel size was not changed
-            w = tools.resize_activations(self.module.weight, module.weight.size())
-            module.weight = nn.Parameter(w)
+            print("RESIZE")
+            if module.bias is not None and self.module.bias.size() != module.bias.size():
+                module.bias = nn.Parameter(tools.resize_1d(self.module.bias, module.bias.size()[0]))
+                print("bias", module.bias.size(), self.module.bias.size())
+            try:
+                w = tools.resize_activations(self.module.weight, module.weight.size())
+                print(self.module.weight.size(), module.weight.size(), w.size())
+                module.weight = nn.Parameter(w)
+            except Exception as e:
+                print("error resizing weights")
+                print(e)
 
         return module
 

@@ -2,6 +2,7 @@ import torch
 import os
 import numpy as np
 from torch.nn import functional as F
+from functools import lru_cache
 
 
 def save_checkpoint(discriminator, generator, epoch, data_folder):
@@ -29,30 +30,49 @@ def round_array(array, max_sum, invert=False):
     return rounded
 
 
-def permutations(generators, discriminators, random=False):
-    ng, nd = len(generators), len(discriminators)
+def coord_1d_2d(x, rows):
+    return x // rows, x % rows
 
-    if ng != nd or random:
-        pairs = np.array(np.meshgrid(range(ng), range(nd))).T.reshape(-1, 2)
-        np.random.shuffle(pairs)
-        return pairs
 
-    # FIXME: should chache pairs for same nd, ng or transform in a generator
+def coord_2d_1d(r, c, rows):
+    return r * rows + c
+
+
+def get_neighbors(center, rows, cols):
+    r, c = coord_1d_2d(center, rows)
+    top = coord_2d_1d((r - 1) % rows, c, rows)
+    bottom = coord_2d_1d((r + 1) % rows, c, rows)
+    right = coord_2d_1d(r, (c + 1) % cols, rows)
+    left = coord_2d_1d(r, (c - 1) % cols, rows)
+    return [center, top, bottom, right, left]
+
+
+@lru_cache(maxsize=10)
+def _permutations(len_a1, len_a2):
     pairs = []
-    j = 0
-    for start_j in range(nd):
-        for i in range(ng):
-            pairs.append((i, (j + start_j) % nd))
-            j = (j + 1) % nd
+    for start_j in range(len_a2):
+        j = 0
+        for i in range(len_a1):
+            pairs.append((i, (j + start_j) % len_a2))
+            j = (j + 1) % len_a2
     return pairs
 
 
-def is_cuda_available():
-    return torch.cuda.is_available()
+def permutations(a1, a2, random=False):
+    len_a1, len_a2 = len(a1), len(a2)
+    if random:
+        pairs = np.array(np.meshgrid(range(len_a1), range(len_a2))).T.reshape(-1, 2)
+        np.random.shuffle(pairs)
+        return pairs
+    return _permutations(len_a1, len_a2)
 
 
-def cuda(variable):
-    return variable.cuda() if is_cuda_available() else variable
+def is_cuda_available(condition=True):
+    return condition and torch.cuda.is_available()
+
+
+def cuda(variable, condition=True):
+    return variable.cuda() if is_cuda_available(condition) else variable
 
 
 # based on https://github.com/github-pengge/PyTorch-progressive_growing_of_gans/blob/master/models/base_model.py
@@ -88,9 +108,9 @@ def resize_activations(v, so):
     #     else:
     #         shape += [1]
     # v = v.repeat(*shape)
-    if si[2] < so[2]:
-        assert so[2] % si[2] == 0 and so[2] / si[2] == so[3] / si[3]  # currently only support this case
-        v = F.interpolate(v, scale_factor=so[2]//si[2], mode='nearest', align_corners=True)
+    if si[2] != so[2]:
+        assert so[2] / si[2] == so[3] / si[3]  # currently only support this case
+        v = F.interpolate(v, size=so[2], mode='nearest')#, align_corners=True)
 
     # Increase feature maps.
     if si[1] < so[1]:
@@ -100,3 +120,18 @@ def resize_activations(v, so):
         z = torch.zeros([so[0] - si[0], v.shape[1]] + so[2:])
         v = torch.cat([v, z], 0)
     return v
+
+
+def resize_1d(x, size):
+    return _resize(x, size, "nearest")
+
+
+def resize_2d(x, size):
+    return _resize(x, size, "bilinear", align_corners=True)
+
+
+def _resize(x, size, mode, align_corners=None):
+    x = x.clone().detach()
+    x = x.expand(1, 1, *x.size())
+    ret = F.interpolate(x, size=size, mode=mode, align_corners=align_corners)
+    return ret[0, 0]

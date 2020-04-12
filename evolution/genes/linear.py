@@ -1,8 +1,8 @@
-# -*- coding: future_fstrings -*-
 import torch.nn as nn
 from .layer import Layer
 from ..config import config
 import numpy as np
+from util import tools
 
 
 class Linear(Layer):
@@ -21,7 +21,8 @@ class Linear(Layer):
             if self.has_minibatch_stddev():
                 self.in_features += 1
         if self.original_out_features is None:
-            self.original_out_features = 2 ** np.random.randint(5, 9)
+            self.original_out_features = 2 ** np.random.randint(config.layer.linear.min_features_power,
+                                                                config.layer.linear.max_features_power+1)
         if self.out_features is None:
             self.out_features = self.original_out_features
 
@@ -42,6 +43,15 @@ class Linear(Layer):
                 nn.init.zeros_(module.bias)
         else:
             nn.init.xavier_uniform_(module.weight)
+        if self.module is not None and config.layer.resize_linear_weights:
+            print("LINEAR RESIZE", self.module.bias.size(), module.bias.size(), self.module.weight.size(), module.weight.size())
+            if module.bias is not None and self.module.bias.size() != module.bias.size():
+                module.bias = nn.Parameter(tools.resize_1d(self.module.bias, module.bias.size()[-1]))
+            if self.module.weight.size() != module.weight.size():
+                print("resize linear weights")
+                w = tools.resize_2d(self.module.weight, module.weight.size())
+                print("linear", self.module.weight.size(), module.weight.size(), w.size())
+                module.weight = nn.Parameter(w)
         return module
 
     def apply_mutation(self):
